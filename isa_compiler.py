@@ -9,16 +9,16 @@ import streamlit as st
 # PAGE CONFIG & STYLING
 # ==============================================================================
 st.set_page_config(
-    page_title="ISA Auto-Compiler v3.0 | Technical Audit Engine",
+    page_title="ISA Auto-Compiler v3.2 | Technical Audit Engine",
     page_icon="📊",
     layout="wide",
 )
 
-st.title("📊 Initial Site Analysis (ISA) Auto-Compiler v3.0")
+st.title("📊 Initial Site Analysis (ISA) Auto-Compiler v3.2")
 st.markdown(
     "Upload your **Initial Site Analysis Spreadsheet Template (.xlsx)** alongside your "
     "Screaming Frog exports (`internal_all`, `all_inlinks`, `all_redirects`, `images_all`) to "
-    "automatically compile clean, internal HTML-only evidence tabs and flag the master checklist."
+    "automatically compile clean, internal evidence tabs and flag the master checklist."
 )
 
 # ==============================================================================
@@ -112,48 +112,79 @@ def is_non_html_asset_url(url: str) -> bool:
         return False
 
 
-def detect_bare_domain(df_internal: pd.DataFrame, addr_col: str | None) -> str:
-    """Identifies the primary internal root domain from internal_all.csv HTML rows."""
+def is_valid_http_url(url: str) -> bool:
+    """Filters out data:, mailto:, tel:, javascript:, and empty strings."""
+    return bool(url) and url.lower().startswith(("http://", "https://"))
+
+
+def build_internal_hosts(df_internal: pd.DataFrame, addr_col: str | None) -> set[str]:
+    """Collects all internal hosts (including www / non-www variants) from internal_all.csv."""
+    hosts: set[str] = set()
     if df_internal.empty or not addr_col:
-        return ""
-    ct_col = find_col(df_internal, ["Content Type", "Content"])
-    urls = clean_str_series(df_internal[addr_col])
-    if ct_col:
-        html_mask = clean_str_series(df_internal[ct_col]).str.lower().str.contains("text/html", na=False)
-        if html_mask.any():
-            urls = urls[html_mask]
-    hosts = [urlparse(u).netloc.lower() for u in urls if u.startswith(("http://", "https://"))]
-    if not hosts:
-        return ""
-    primary_host = pd.Series(hosts).value_counts().idxmax()
-    return primary_host[4:] if primary_host.startswith("www.") else primary_host
+        return hosts
+    for u in clean_str_series(df_internal[addr_col]):
+        if is_valid_http_url(u):
+            h = urlparse(u).netloc.lower()
+            if h:
+                hosts.add(h)
+                if h.startswith("www."):
+                    hosts.add(h[4:])
+                else:
+                    hosts.add(f"www.{h}")
+    return hosts
 
 
-def is_internal_host(url: str, bare_domain: str) -> bool:
-    """Returns True if URL belongs to the crawled internal domain (including www/subdomains)."""
-    if not url or not url.startswith(("http://", "https://")):
+def is_internal_host(url: str, internal_hosts: set[str]) -> bool:
+    """Returns True if URL belongs to the crawled internal host set."""
+    if not is_valid_http_url(url):
         return False
-    if not bare_domain:
+    if not internal_hosts:
         return True
     host = urlparse(url).netloc.lower()
-    return host == bare_domain or host == f"www.{bare_domain}" or host.endswith(f".{bare_domain}")
+    return host in internal_hosts
 
 
-def is_internal_html_url(url: str, bare_domain: str, url_to_ct: dict[str, str]) -> bool:
-    """Returns True only if URL is internal, not a static non-HTML asset, and has HTML (or blank) Content-Type."""
-    if not is_internal_host(url, bare_domain):
+def is_internal_page_candidate(
+    url: str,
+    internal_hosts: set[str],
+    url_to_ct: dict[str, str],
+    url_to_status: dict[str, int],
+    strict_200_html: bool = False,
+) -> bool:
+    """
+    Validates that a URL is internal and not a static asset.
+    - Never rejects 3xx/4xx/5xx URLs due to text/plain or application/json error Content-Types.
+    - When strict_200_html=True (for on-page Title/Meta/H1 checks), ensures 200 OK rows are text/html.
+    """
+    if not is_internal_host(url, internal_hosts):
         return False
     if is_non_html_asset_url(url):
         return False
-    ct = url_to_ct.get(url, "") or url_to_ct.get(strip_fragment(url), "")
-    if ct and "text/html" not in ct.lower():
-        return False
+
+    base_u = strip_fragment(url)
+    st = url_to_status.get(url, url_to_status.get(base_u, 0))
+    ct = (url_to_ct.get(url, "") or url_to_ct.get(base_u, "")).lower()
+
+    if st == 200 and ct:
+        if any(x in ct for x in ("image/", "text/css", "javascript", "font/", "application/pdf", "application/xml", "text/xml")):
+            return False
+        if strict_200_html and "text/html" not in ct:
+            return False
+
     return True
 
 
-def is_clean_internal_source(url: str, bare_domain: str, url_to_ct: dict[str, str]) -> bool:
-    """Internal HTML URL with zero query parameters (?)."""
-    return (not has_query_params(url)) and is_internal_html_url(url, bare_domain, url_to_ct)
+def is_clean_internal_source(
+    url: str,
+    internal_hosts: set[str],
+    url_to_ct: dict[str, str],
+    url_to_status: dict[str, int],
+    strict_200_html: bool = False,
+) -> bool:
+    """Internal non-asset URL with zero query parameters (?)."""
+    if has_query_params(url):
+        return False
+    return is_internal_page_candidate(url, internal_hosts, url_to_ct, url_to_status, strict_200_html=strict_200_html)
 
 
 def suggest_parent_redirect(url: str, live_urls_set: set[str]) -> str:
@@ -212,16 +243,10 @@ def run_audit_engine(
     df_inlinks: pd.DataFrame,
     df_redirects: pd.DataFrame,
     df_images: pd.DataFrame,
+    df_sitemaps: pd.DataFrame,
     df_gsc: pd.DataFrame,
     df_backlinks: pd.DataFrame,
 ) -> tuple[dict[str, list[list]], dict[str, tuple[str, str]]]:
-    """
-    Computes all evidence tab rows and master sheet updates keyed by ITEM substring.
-    Enforces:
-      - Clean Source URLs (no ? parameters)
-      - Internal HTML-only data (except dedicated Image tabs)
-      - Same-page / #fragment link filtering
-    """
     tab_data: dict[str, list[list]] = {}
     master_updates: dict[str, tuple[str, str]] = {}
 
@@ -244,18 +269,27 @@ def run_audit_engine(
             else:
                 master_updates[key] = (ISSUE_NO, clean_msg)
 
-    # Global lookup maps built from internal_all.csv
     live_200_urls: set[str] = set()
     url_to_canonical: dict[str, str] = {}
     url_to_status: dict[str, int] = {}
     url_to_indexability: dict[str, str] = {}
     url_to_size: dict[str, int] = {}
     url_to_ct: dict[str, str] = {}
-    bare_domain: str = ""
+    internal_hosts: set[str] = set()
+    sitemap_url_set: set[str] = set()
+
+    # Optional dedicated Sitemaps export (SF -> Sitemaps -> URLs in Sitemap)
+    if not df_sitemaps.empty:
+        sm_addr_col = find_col(df_sitemaps, ["Address", "URL"])
+        if sm_addr_col:
+            sitemap_url_set = set(clean_str_series(df_sitemaps[sm_addr_col]).tolist())
 
     # --------------------------------------------------------------------------
     # 1. PARSE INTERNAL_ALL.CSV
     # --------------------------------------------------------------------------
+    df_pages_clean = pd.DataFrame()
+    df_html_clean_200 = pd.DataFrame()
+
     if not df_internal.empty:
         addr_col = find_col(df_internal, ["Address", "URL"])
         ct_col = find_col(df_internal, ["Content Type", "Content"])
@@ -282,7 +316,7 @@ def run_audit_engine(
         og_title_col = find_col(df_internal, ["Open Graph Title", "og:title", "og:title 1"], allow_substring=True)
         og_url_col = find_col(df_internal, ["Open Graph URL", "og:url", "og:url 1"], allow_substring=True)
 
-        bare_domain = detect_bare_domain(df_internal, addr_col)
+        internal_hosts = build_internal_hosts(df_internal, addr_col)
 
         df_int = df_internal.copy()
         df_int["_url"] = clean_str_series(df_int[addr_col]) if addr_col else ""
@@ -300,47 +334,55 @@ def run_audit_engine(
             url_to_indexability[u] = row["_indexability"]
             url_to_size[u] = row["_size"]
             url_to_ct[u] = row["_ct"]
-            if st_code == 200 and is_clean_internal_source(u, bare_domain, url_to_ct):
+            if st_code == 200 and is_clean_internal_source(u, internal_hosts, url_to_ct, url_to_status, strict_200_html=True):
                 live_200_urls.add(u)
 
-        # Filter to Internal HTML rows (and clean source rows without ? parameters)
-        df_int["_is_int_html"] = df_int["_url"].apply(lambda u: is_internal_html_url(u, bare_domain, url_to_ct))
-        df_int["_is_clean_src"] = df_int["_is_int_html"] & (~df_int["_url"].apply(has_query_params))
+        if sitemap_col and not sitemap_url_set:
+            in_sm_mask_raw = clean_str_series(df_int[sitemap_col]).str.lower().isin(["true", "yes", "1"])
+            sitemap_url_set = set(df_int.loc[in_sm_mask_raw, "_url"].tolist())
 
-        df_html_all = df_int[df_int["_is_int_html"]].copy()       # Internal HTML (keeps ? for Pagination)
-        df_html_clean = df_int[df_int["_is_clean_src"]].copy()    # Internal HTML + NO ? parameters
-        df_html_clean_200 = df_html_clean[df_html_clean["_status"] == 200].copy()
+        # Clean internal page rows (no ? params, no static assets, preserves 3xx/4xx/5xx)
+        df_int["_is_clean_page"] = df_int["_url"].apply(
+            lambda u: is_clean_internal_source(u, internal_hosts, url_to_ct, url_to_status, strict_200_html=False)
+        )
+        # Strict 200 OK HTML pages (no ? params) for on-page SEO checks
+        df_int["_is_clean_200_html"] = (df_int["_status"] == 200) & df_int["_url"].apply(
+            lambda u: is_clean_internal_source(u, internal_hosts, url_to_ct, url_to_status, strict_200_html=True)
+        )
 
-        # Internal Pages | 5xx Errors (Internal HTML, clean source URLs)
-        rows_5xx = [[u] for u in df_html_clean.loc[df_html_clean["_status"].between(500, 599), "_url"].tolist()]
+        df_pages_clean = df_int[df_int["_is_clean_page"]].copy()
+        df_html_clean_200 = df_int[df_int["_is_clean_200_html"]].copy()
+
+        # Internal Pages | 5xx Errors
+        rows_5xx = [[u] for u in df_pages_clean.loc[df_pages_clean["_status"].between(500, 599), "_url"].tolist()]
         record_check(
             "Pages returning 5xx Errors",
             rows_5xx,
             ["Pages Returning 5xx Errors"],
-            "Found {count} internal HTML URL(s) returning 5xx server errors (see 'Pages returning 5xx Errors' tab).",
+            "Found {count} internal URL(s) returning 5xx server errors (see 'Pages returning 5xx Errors' tab).",
         )
 
-        # Internal Pages | 4xx Errors (Internal HTML, clean source URLs)
-        urls_4xx = df_html_clean.loc[df_html_clean["_status"].between(400, 499), "_url"].tolist()
+        # Internal Pages | 4xx Errors
+        urls_4xx = df_pages_clean.loc[df_pages_clean["_status"].between(400, 499), "_url"].tolist()
         rows_4xx = [[u, suggest_parent_redirect(u, live_200_urls)] for u in urls_4xx]
         record_check(
             "Pages returning 4xx Errors",
             rows_4xx,
             ["Pages Returning 4xx Errors"],
-            "Found {count} internal HTML URL(s) returning 4xx errors (see 'Pages returning 4xx Errors' tab).",
+            "Found {count} internal URL(s) returning 4xx errors (see 'Pages returning 4xx Errors' tab).",
         )
 
         # HTTPS checks
-        http_urls = df_html_clean.loc[df_html_clean["_url"].str.startswith("http://"), "_url"].tolist()
+        http_urls = df_pages_clean.loc[df_pages_clean["_url"].str.startswith("http://"), "_url"].tolist()
         if http_urls:
-            master_updates["Website is not using HTTPS"] = (ISSUE_YES, f"Found {len(http_urls)} internal HTML URL(s) served over insecure HTTP.")
-            master_updates["HTTP vs. HTTPS"] = (ISSUE_YES, f"Found {len(http_urls)} HTTP HTML URL(s) accessible alongside HTTPS.")
+            master_updates["Website is not using HTTPS"] = (ISSUE_YES, f"Found {len(http_urls)} internal URL(s) served over insecure HTTP.")
+            master_updates["HTTP vs. HTTPS"] = (ISSUE_YES, f"Found {len(http_urls)} HTTP URL(s) accessible alongside HTTPS.")
         else:
-            master_updates["Website is not using HTTPS"] = (ISSUE_NO, "All crawled internal HTML URLs use HTTPS.")
+            master_updates["Website is not using HTTPS"] = (ISSUE_NO, "All crawled internal URLs use HTTPS.")
             master_updates["HTTP vs. HTTPS"] = (ISSUE_NO, "No duplicate HTTP URLs detected.")
 
         # www vs non-www check
-        hosts = {urlparse(u).netloc.lower() for u in df_html_clean["_url"] if u.startswith("http")}
+        hosts = {urlparse(u).netloc.lower() for u in df_pages_clean["_url"] if u.startswith("http")}
         has_www = any(h.startswith("www.") for h in hosts)
         has_non_www = any(not h.startswith("www.") for h in hosts)
         if has_www and has_non_www:
@@ -348,17 +390,17 @@ def run_audit_engine(
         else:
             master_updates["Duplicates due to www and non-www"] = (ISSUE_NO, f"Consistent host version detected ({', '.join(sorted(hosts))}).")
 
-        # XML Sitemap Checks (Internal HTML, clean source URLs)
-        if sitemap_col:
-            in_sm = clean_str_series(df_html_clean[sitemap_col]).str.lower().isin(["true", "yes", "1"])
-            df_sm = df_html_clean[in_sm]
+        # XML Sitemap Checks (works from either sitemaps_all.csv OR In Sitemap column)
+        if sitemap_url_set:
+            in_sm = df_pages_clean["_url"].isin(sitemap_url_set)
+            df_sm = df_pages_clean[in_sm]
 
             sm_4xx = [[u] for u in df_sm.loc[df_sm["_status"].between(400, 499), "_url"].tolist()]
             record_check(
                 "XML Sitemap - 4xx error ",
                 sm_4xx,
                 ["XML Sitemap  | 4xx errors"],
-                "Found {count} 4xx HTML URL(s) inside XML Sitemap (see 'XML Sitemap - 4xx error ' tab).",
+                "Found {count} 4xx URL(s) inside XML Sitemap (see 'XML Sitemap - 4xx error ' tab).",
             )
 
             sm_5xx = [[u] for u in df_sm.loc[df_sm["_status"].between(500, 599), "_url"].tolist()]
@@ -366,7 +408,7 @@ def run_audit_engine(
                 "XML Sitemap - 5xx error",
                 sm_5xx,
                 ["XML Sitemap  | 5xx errors"],
-                "Found {count} 5xx HTML URL(s) inside XML Sitemap (see 'XML Sitemap - 5xx error' tab).",
+                "Found {count} 5xx URL(s) inside XML Sitemap (see 'XML Sitemap - 5xx error' tab).",
             )
 
             sm_non_canon = []
@@ -378,11 +420,11 @@ def run_audit_engine(
                 "XML Sitemap - Non canonical URl",
                 sm_non_canon,
                 ["XML Sitemap  | Non-canonical URLs"],
-                "Found {count} non-canonical/non-indexable HTML URL(s) in XML Sitemap (see 'XML Sitemap - Non canonical URl' tab).",
+                "Found {count} non-canonical/non-indexable URL(s) in XML Sitemap (see 'XML Sitemap - Non canonical URl' tab).",
             )
 
             sm_missing = []
-            for _, r in df_html_clean_200[~in_sm.loc[df_html_clean_200.index]].iterrows():
+            for _, r in df_html_clean_200[~df_html_clean_200["_url"].isin(sitemap_url_set)].iterrows():
                 u, c = r["_url"], r["_canonical"]
                 if r["_indexability"].lower() == "indexable" and (not c or c == u):
                     sm_missing.append([u])
@@ -395,16 +437,16 @@ def run_audit_engine(
 
         # Orphan Pages
         if inlinks_col:
-            inlink_counts = pd.to_numeric(df_html_clean[inlinks_col], errors="coerce").fillna(0)
-            orphans = df_html_clean.loc[inlink_counts == 0, "_url"].tolist()
+            inlink_counts = pd.to_numeric(df_html_clean_200[inlinks_col], errors="coerce").fillna(0)
+            orphans = df_html_clean_200.loc[inlink_counts == 0, "_url"].tolist()
             if orphans:
                 master_updates["Internal Pages | Orphan Pages"] = (ISSUE_YES, f"Found {len(orphans)} clean internal HTML page(s) with 0 internal inlinks.")
             else:
                 master_updates["Internal Pages | Orphan Pages"] = (ISSUE_NO, "0 orphan HTML pages detected in crawl.")
 
-        # Uppercase in URLs (Internal HTML, clean source URLs; Ugly URLs removed per spec)
+        # Uppercase in URLs
         upper_rows = []
-        for u in df_html_clean["_url"].unique():
+        for u in df_pages_clean["_url"].unique():
             path_only = urlparse(u).path
             if any(c.isupper() for c in path_only):
                 upper_rows.append([u, suggest_clean_slug(u)])
@@ -419,8 +461,8 @@ def run_audit_engine(
             "Found {count} 200 OK HTML page(s) missing a canonical tag (see 'Duplicates from Non-canonicaliz' tab).",
         )
 
-        # Duplicates from trailing slashes
-        all_clean_html_set = set(df_html_clean["_url"].tolist())
+        # Duplicates from trailing slashes (200 OK duplicates only)
+        all_clean_html_set = set(df_html_clean_200["_url"].tolist())
         trailing_rows = []
         seen_pairs = set()
         for u in sorted(all_clean_html_set):
@@ -442,13 +484,16 @@ def run_audit_engine(
             "Found {count} URL(s) accessible with both trailing and non-trailing slashes (see 'Duplicates from trailing slashe' tab).",
         )
 
-        # Pagination (Internal HTML; keeps ?page=2 parameters)
-        df_html_all_200 = df_html_all[df_html_all["_status"] == 200]
+        # Pagination (Keeps ?page=2 URLs while excluding static assets & external hosts)
+        df_all_200_html = df_int[
+            (df_int["_status"] == 200)
+            & df_int["_url"].apply(lambda u: is_internal_page_candidate(u, internal_hosts, url_to_ct, url_to_status, strict_200_html=True))
+        ]
         pag_rows = []
         pag_pattern = re.compile(r"(/page/\d+|[?&](page|p|paged)=\d+)", re.I)
-        rel_next_s = clean_str_series(df_html_all_200[rel_next_col]) if rel_next_col else pd.Series("", index=df_html_all_200.index)
-        rel_prev_s = clean_str_series(df_html_all_200[rel_prev_col]) if rel_prev_col else pd.Series("", index=df_html_all_200.index)
-        for idx, r in df_html_all_200.iterrows():
+        rel_next_s = clean_str_series(df_all_200_html[rel_next_col]) if rel_next_col else pd.Series("", index=df_all_200_html.index)
+        rel_prev_s = clean_str_series(df_all_200_html[rel_prev_col]) if rel_prev_col else pd.Series("", index=df_all_200_html.index)
+        for idx, r in df_all_200_html.iterrows():
             u = r["_url"]
             if pag_pattern.search(u) and not rel_next_s.loc[idx] and not rel_prev_s.loc[idx]:
                 pag_rows.append([u, r["_canonical"] or u])
@@ -603,7 +648,7 @@ def run_audit_engine(
             master_updates["Open Graph URL not matching canonical"] = (ISSUE_YES, f"Found {og_mismatch} page(s) where og:url does not match canonical URL.") if og_mismatch else (ISSUE_NO, "og:url tags match canonical URLs.")
 
     # --------------------------------------------------------------------------
-    # 2. PARSE ALL_REDIRECTS.CSV (INTERNAL HTML ONLY, CLEAN SOURCE URLS)
+    # 2. PARSE ALL_REDIRECTS.CSV (INTERNAL NON-ASSET PAGES, CLEAN SOURCE URLS)
     # --------------------------------------------------------------------------
     redirect_map: dict[str, tuple[str, int, int]] = {}
     if not df_redirects.empty:
@@ -620,15 +665,13 @@ def run_audit_engine(
         df_red["_hops"] = pd.to_numeric(df_red[r_hops_col], errors="coerce").fillna(1).astype(int) if r_hops_col else 1
         df_red["_loop"] = clean_str_series(df_red[r_loop_col]).str.lower().isin(["true", "yes", "1"]) if r_loop_col else False
 
-        # Build complete internal lookup map first (used to resolve internal link destinations)
         for _, r in df_red.iterrows():
-            if r["_src"] and is_internal_html_url(r["_src"], bare_domain, url_to_ct):
-                redirect_map[r["_src"]] = (r["_fin"], r["_fstat"], r["_hops"])
+            if r["_src"] and is_internal_page_candidate(r["_src"], internal_hosts, url_to_ct, url_to_status):
+                redirect_map[strip_fragment(r["_src"])] = (r["_fin"], r["_fstat"], r["_hops"])
 
-        # Filter redirects for Redirect tabs: clean internal HTML source + internal HTML destination (no external/assets)
         valid_red_mask = (
-            df_red["_src"].apply(lambda u: is_clean_internal_source(u, bare_domain, url_to_ct))
-            & df_red["_fin"].apply(lambda u: (not u) or is_internal_html_url(u, bare_domain, url_to_ct))
+            df_red["_src"].apply(lambda u: is_clean_internal_source(u, internal_hosts, url_to_ct, url_to_status))
+            & df_red["_fin"].apply(lambda u: (not u) or is_internal_page_candidate(u, internal_hosts, url_to_ct, url_to_status))
         )
         df_red_clean = df_red[valid_red_mask].copy()
 
@@ -641,7 +684,7 @@ def run_audit_engine(
             "Redirects to missing pages",
             red_missing,
             ["Redirects to Missing Pages"],
-            "Found {count} internal HTML redirect(s) resolving to missing/error pages (see 'Redirects to missing pages' tab).",
+            "Found {count} internal redirect(s) resolving to missing/error pages (see 'Redirects to missing pages' tab).",
         )
 
         # Chains Redirects (2+ hops or Redirect Loops)
@@ -653,25 +696,21 @@ def run_audit_engine(
             tab_data["Chains Redirects"] = chain_rows
             master_updates["Internal Pages | Chains Redirects"] = (
                 ISSUE_YES,
-                f"Found {len(df_chains)} internal HTML redirect chain(s)/loop(s) (see 'Chains Redirects' tab).",
+                f"Found {len(df_chains)} internal redirect chain(s)/loop(s) (see 'Chains Redirects' tab).",
             )
         else:
             tab_data["Chains Redirects"] = []
-            master_updates["Internal Pages | Chains Redirects"] = (ISSUE_NO, "0 multi-hop internal HTML redirect chains found.")
+            master_updates["Internal Pages | Chains Redirects"] = (ISSUE_NO, "0 multi-hop internal redirect chains found.")
 
         # XML Sitemap - Redirecting
-        if not df_internal.empty and find_col(df_internal, ["In Sitemap", "Sitemap"], allow_substring=True):
-            sm_col = find_col(df_internal, ["In Sitemap", "Sitemap"], allow_substring=True)
-            in_sm_mask = clean_str_series(df_internal[sm_col]).str.lower().isin(["true", "yes", "1"])
-            addr_c = find_col(df_internal, ["Address", "URL"])
-            sm_urls = [
-                u for u in clean_str_series(df_internal.loc[in_sm_mask, addr_c]).tolist()
-                if is_clean_internal_source(u, bare_domain, url_to_ct)
-            ]
+        if sitemap_url_set:
             sm_red_rows = []
-            for u in sm_urls:
-                if u in redirect_map:
-                    fin_u = redirect_map[u][0]
+            for u in sorted(sitemap_url_set):
+                if not is_clean_internal_source(u, internal_hosts, url_to_ct, url_to_status):
+                    continue
+                base_u = strip_fragment(u)
+                if base_u in redirect_map:
+                    fin_u = redirect_map[base_u][0]
                     if not is_same_page_or_fragment(u, fin_u):
                         sm_red_rows.append([u, fin_u])
                 elif 300 <= url_to_status.get(u, 0) < 400:
@@ -680,11 +719,11 @@ def run_audit_engine(
                 "XML Sitemap - Redirecting",
                 sm_red_rows,
                 ["XML Sitemap  | Redirecting"],
-                "Found {count} redirecting internal HTML URL(s) in the XML Sitemap (see 'XML Sitemap - Redirecting' tab).",
+                "Found {count} redirecting internal URL(s) in the XML Sitemap (see 'XML Sitemap - Redirecting' tab).",
             )
 
     # --------------------------------------------------------------------------
-    # 3. PARSE ALL_INLINKS.CSV (CLEAN SOURCE, NO FRAGMENTS, INTERNAL HTML ONLY)
+    # 3. PARSE ALL_INLINKS.CSV (VECTORIZED, CLEAN SOURCE, NO FRAGMENTS)
     # --------------------------------------------------------------------------
     df_img_inlinks = pd.DataFrame()
     if not df_inlinks.empty:
@@ -702,6 +741,7 @@ def run_audit_engine(
         df_inl_all["_type"] = clean_str_series(df_inl_all[type_col]).str.lower() if type_col else "hyperlink"
         df_inl_all["_src"] = clean_str_series(df_inl_all[src_col]) if src_col else ""
         df_inl_all["_dst"] = clean_str_series(df_inl_all[dst_col]) if dst_col else ""
+        df_inl_all["_dst_base"] = df_inl_all["_dst"].apply(strip_fragment)
         df_inl_all["_anc"] = clean_str_series(df_inl_all[anc_col]) if anc_col else ""
         df_inl_all["_alt"] = clean_str_series(df_inl_all[alt_col]) if alt_col else ""
         df_inl_all["_sc"] = pd.to_numeric(df_inl_all[sc_col], errors="coerce").fillna(0).astype(int) if sc_col else 0
@@ -709,36 +749,36 @@ def run_audit_engine(
         df_inl_all["_rel"] = clean_str_series(df_inl_all[rel_col]).str.lower() if rel_col else ""
         df_inl_all["_pos"] = clean_str_series(df_inl_all[pos_col]).str.lower() if pos_col else ""
 
-        # Fallback bare_domain detection if internal_all didn't provide it
-        if not bare_domain:
-            src_hosts = [urlparse(u).netloc.lower() for u in df_inl_all["_src"] if u.startswith("http")]
-            if src_hosts:
-                p_host = pd.Series(src_hosts).value_counts().idxmax()
-                bare_domain = p_host[4:] if p_host.startswith("www.") else p_host
+        if not internal_hosts:
+            internal_hosts = build_internal_hosts(df_inl_all, "_src")
 
-        # Enforce clean internal HTML Source Page (no ? params, internal HTML only) for ALL inlinks (including images)
-        clean_src_mask = df_inl_all["_src"].apply(lambda u: is_clean_internal_source(u, bare_domain, url_to_ct))
+        # Clean internal Source Page (no ? params, internal host, non-asset)
+        clean_src_mask = df_inl_all["_src"].apply(
+            lambda u: is_clean_internal_source(u, internal_hosts, url_to_ct, url_to_status)
+        )
         df_inl_clean_src = df_inl_all[clean_src_mask].copy()
 
-        # Image inlinks: Source Page is clean internal HTML; Destination is Image URL (CDN/external allowed)
-        df_img_inlinks = df_inl_clean_src[df_inl_clean_src["_type"].str.contains("image", na=False)].copy()
+        # Image inlinks: Clean internal Source Page + Valid HTTP/HTTPS Image URL (drops data:image/svg+xml!)
+        df_img_inlinks = df_inl_clean_src[
+            df_inl_clean_src["_type"].str.contains("image", na=False)
+            & df_inl_clean_src["_dst"].apply(is_valid_http_url)
+        ].copy()
 
-        # Hyperlinks: Internal HTML Source + Internal HTML Destination + Exclude Same-Page / #Fragment links
+        # Hyperlinks: Internal Source + Internal Page Destination + Exclude Same-Page / #Fragment
         df_hyp = df_inl_clean_src[
             df_inl_clean_src["_type"].str.contains("hyperlink|ahref|^a$|^$", regex=True, na=False)
         ].copy()
 
-        dst_int_html_mask = df_hyp["_dst"].apply(lambda u: is_internal_html_url(u, bare_domain, url_to_ct))
-        not_self_frag_mask = [
-            not is_same_page_or_fragment(s, d) for s, d in zip(df_hyp["_src"], df_hyp["_dst"])
-        ]
-        df_int_links = df_hyp[dst_int_html_mask & pd.Series(not_self_frag_mask, index=df_hyp.index)].copy()
+        dst_int_page_mask = df_hyp["_dst"].apply(
+            lambda u: is_internal_page_candidate(u, internal_hosts, url_to_ct, url_to_status)
+        )
+        not_self_frag_mask = df_hyp["_src"].apply(strip_fragment) != df_hyp["_dst_base"]
+        df_int_links = df_hyp[dst_int_page_mask & not_self_frag_mask].copy()
 
         # Internal Links Returning 404 Errors
+        urls_4xx_set = {strip_fragment(u) for u, st in url_to_status.items() if 400 <= st < 500}
+        mask_404 = df_int_links["_sc"].between(400, 499) | df_int_links["_dst_base"].isin(urls_4xx_set)
         inl_404 = []
-        mask_404 = df_int_links["_sc"].between(400, 499) | df_int_links["_dst"].map(
-            lambda u: 400 <= url_to_status.get(u, 0) < 500
-        )
         for _, r in df_int_links[mask_404].drop_duplicates(subset=["_src", "_dst", "_anc"]).iterrows():
             sug = suggest_parent_redirect(r["_dst"], live_200_urls)
             fix_txt = f"Update link to: {sug}" if sug else "Remove broken link or update to live page"
@@ -747,14 +787,14 @@ def run_audit_engine(
             "Internal Links to 404 pages",
             inl_404,
             ["Internal Links Returning 404 Errors"],
-            "Found {count} internal link(s) pointing to 404 HTML pages (see 'Internal Links to 404 pages' tab).",
+            "Found {count} internal link(s) pointing to 404 pages (see 'Internal Links to 404 pages' tab).",
         )
 
         # Internal Links That Are Redirecting
+        mask_red = df_int_links["_sc"].between(300, 399) | df_int_links["_dst_base"].isin(redirect_map.keys())
         inl_red = []
-        mask_red = df_int_links["_sc"].between(300, 399) | df_int_links["_dst"].isin(redirect_map.keys())
         for _, r in df_int_links[mask_red].drop_duplicates(subset=["_src", "_dst", "_anc"]).iterrows():
-            true_dest = redirect_map[r["_dst"]][0] if r["_dst"] in redirect_map else ""
+            true_dest = redirect_map[r["_dst_base"]][0] if r["_dst_base"] in redirect_map else ""
             if true_dest and is_same_page_or_fragment(r["_src"], true_dest):
                 continue
             inl_red.append([r["_src"], r["_anc"], r["_dst"], true_dest])
@@ -762,22 +802,27 @@ def run_audit_engine(
             "Internal Links to redirecting p",
             inl_red,
             ["Internal Links That Are Redirecting"],
-            "Found {count} internal link(s) pointing to redirecting HTML URLs (see 'Internal Links to redirecting p' tab).",
+            "Found {count} internal link(s) pointing to redirecting URLs (see 'Internal Links to redirecting p' tab).",
         )
 
-        # Internal Links That Are Non-Canonical
+        # Internal Links That Are Non-Canonical (Vectorized pre-filter for instant execution!)
+        non_canon_map = {
+            strip_fragment(u): c
+            for u, c in url_to_canonical.items()
+            if url_to_status.get(u, 0) == 200 and c and strip_fragment(c) != strip_fragment(u)
+        }
         inl_noncanon = []
-        for _, r in df_int_links.drop_duplicates(subset=["_src", "_dst", "_anc"]).iterrows():
-            dst = r["_dst"]
-            st_c = r["_sc"] or url_to_status.get(dst, 0)
-            canon = url_to_canonical.get(dst, "")
-            if st_c == 200 and canon and strip_fragment(canon) != strip_fragment(dst):
-                inl_noncanon.append([r["_src"], r["_anc"], dst, canon])
+        if non_canon_map:
+            df_nc = df_int_links[df_int_links["_dst_base"].isin(non_canon_map.keys())].drop_duplicates(
+                subset=["_src", "_dst", "_anc"]
+            )
+            for _, r in df_nc.iterrows():
+                inl_noncanon.append([r["_src"], r["_anc"], r["_dst"], non_canon_map[r["_dst_base"]]])
         record_check(
             "InLinks to non-canonical pages",
             inl_noncanon,
             ["Internal Links That Are Non-Canonical"],
-            "Found {count} internal link(s) pointing to non-canonical HTML URLs (see 'InLinks to non-canonical pages' tab).",
+            "Found {count} internal link(s) pointing to non-canonical URLs (see 'InLinks to non-canonical pages' tab).",
         )
 
         # Internal Links That Are Unsecure (HTTP)
@@ -804,7 +849,7 @@ def run_audit_engine(
             "Found {count} internal link(s) with nofollow attributes (see 'Nofollow internal links' tab).",
         )
 
-        # Footer Links (Unique internal HTML footer link destinations)
+        # Footer Links
         if pos_col:
             footer_dsts = sorted(df_int_links.loc[df_int_links["_pos"] == "footer", "_dst"].unique().tolist())
             footer_rows = [[u] for u in footer_dsts]
@@ -812,11 +857,11 @@ def run_audit_engine(
                 "Footer links",
                 footer_rows,
                 ["Internal Link Issues | Footer links"],
-                "Extracted {count} unique internal HTML footer link destination(s) for review (see 'Footer links' tab).",
+                "Extracted {count} unique internal footer link destination(s) for review (see 'Footer links' tab).",
             )
 
     # --------------------------------------------------------------------------
-    # 4. IMAGE AUDIT ENGINE (CLEAN INTERNAL HTML SOURCE; CDN/IMAGE ASSETS ALLOWED)
+    # 4. IMAGE AUDIT ENGINE (CLEAN INTERNAL SOURCE; CDN/IMAGE ASSETS ALLOWED)
     # --------------------------------------------------------------------------
     img_status_map: dict[str, int] = {}
     img_size_map: dict[str, int] = {}
@@ -827,7 +872,7 @@ def run_audit_engine(
         i_sz_col = find_col(df_images, ["Size (Bytes)", "Size"])
         for _, r in df_images.iterrows():
             u = str(r[i_url_col]).strip() if i_url_col and pd.notna(r[i_url_col]) else ""
-            if u:
+            if is_valid_http_url(u):
                 if i_sc_col and pd.notna(r[i_sc_col]):
                     img_status_map[u] = int(pd.to_numeric(r[i_sc_col], errors="coerce") or 0)
                 if i_sz_col and pd.notna(r[i_sz_col]):
@@ -838,7 +883,6 @@ def run_audit_engine(
     for u, sz in url_to_size.items():
         img_size_map.setdefault(u, sz)
 
-    # Support direct upload of "All Image Inlinks" into df_images if all_inlinks wasn't uploaded
     if df_img_inlinks.empty and not df_images.empty and find_col(df_images, ["Source"]):
         s_c = find_col(df_images, ["Source"])
         d_c = find_col(df_images, ["Destination", "Address", "Image URL"])
@@ -851,7 +895,8 @@ def run_audit_engine(
             "_sc": pd.to_numeric(df_images[sc_c], errors="coerce").fillna(0).astype(int) if sc_c else 0,
         })
         df_img_inlinks = tmp_img[
-            tmp_img["_src"].apply(lambda u: is_clean_internal_source(u, bare_domain, url_to_ct))
+            tmp_img["_src"].apply(lambda u: is_clean_internal_source(u, internal_hosts, url_to_ct, url_to_status))
+            & tmp_img["_dst"].apply(is_valid_http_url)
         ].copy()
 
     if not df_img_inlinks.empty or not df_images.empty:
@@ -924,7 +969,7 @@ def run_audit_engine(
         )
 
     # --------------------------------------------------------------------------
-    # 5. OPTIONAL: GSC EXCLUDED / PAGES EXPORT (INTERNAL HTML, CLEAN SOURCE)
+    # 5. OPTIONAL: GSC EXCLUDED / PAGES EXPORT
     # --------------------------------------------------------------------------
     if not df_gsc.empty:
         g_url_col = find_col(df_gsc, ["URL", "Page", "Address"])
@@ -939,7 +984,7 @@ def run_audit_engine(
 
             for _, r in df_g.iterrows():
                 u, reason = r["_u"], r["_r"]
-                if not is_clean_internal_source(u, bare_domain, url_to_ct):
+                if not is_clean_internal_source(u, internal_hosts, url_to_ct, url_to_status):
                     continue
                 r_low = reason.lower()
                 if "soft 404" in r_low:
@@ -983,14 +1028,14 @@ def run_audit_engine(
         if bl_target_col and url_to_status:
             bl_404_urls = sorted({
                 u for u in clean_str_series(df_backlinks[bl_target_col]).unique()
-                if is_clean_internal_source(u, bare_domain, url_to_ct) and 400 <= url_to_status.get(u, 0) < 500
+                if is_clean_internal_source(u, internal_hosts, url_to_ct, url_to_status) and 400 <= url_to_status.get(u, 0) < 500
             })
             bl_404_rows = [[u, suggest_parent_redirect(u, live_200_urls)] for u in bl_404_urls]
             record_check(
                 "Backlinks to non-existing pages",
                 bl_404_rows,
                 ["Backlinks Returning 404 Errors"],
-                "Found {count} broken 404 internal HTML target URL(s) receiving external backlinks (see 'Backlinks to non-existing pages' tab).",
+                "Found {count} broken 404 internal target URL(s) receiving external backlinks (see 'Backlinks to non-existing pages' tab).",
             )
 
     return tab_data, master_updates
@@ -1053,8 +1098,6 @@ def compile_workbook(
         if not rows or sheet_name not in wb.sheetnames:
             continue
         ws = wb[sheet_name]
-
-        # Raw dump tabs include their own CSV headers as rows[0] -> write starting at Row 1
         start_row = 1 if sheet_name in RAW_DUMP_TABS else 2
 
         for r_offset, row_vals in enumerate(rows):
@@ -1085,6 +1128,7 @@ with st.sidebar:
     f_inlinks = st.file_uploader("all_inlinks.csv (Recommended)", type=["csv"])
     f_redirects = st.file_uploader("all_redirects.csv (Recommended)", type=["csv"])
     f_images = st.file_uploader("images_all.csv (Recommended)", type=["csv"])
+    f_sitemaps = st.file_uploader("sitemaps_all.csv (Optional - SF Sitemaps)", type=["csv"])
 
     st.header("3. Optional Exports")
     f_gsc = st.file_uploader("GSC Pages / Excluded (.csv)", type=["csv"])
@@ -1099,18 +1143,19 @@ if st.button("🚀 Compile Initial Site Analysis Workbook", type="primary", use_
             df_inl = load_csv_robust(f_inlinks)
             df_red = load_csv_robust(f_redirects)
             df_img = load_csv_robust(f_images)
+            df_sm = load_csv_robust(f_sitemaps)
             df_gsc = load_csv_robust(f_gsc)
             df_bl = load_csv_robust(f_backlinks)
 
             tab_data, master_updates = run_audit_engine(
-                df_int, df_inl, df_red, df_img, df_gsc, df_bl
+                df_int, df_inl, df_red, df_img, df_sm, df_gsc, df_bl
             )
 
             compiled_bytes = compile_workbook(
                 template_file.getvalue(), tab_data, master_updates
             )
 
-        st.success("✅ Initial Site Analysis v3.0 compiled! Review the summary below and download your workbook.")
+        st.success("✅ Initial Site Analysis v3.2 compiled! Review the summary below and download your workbook.")
 
         issues_flagged = sum(1 for v in master_updates.values() if v[0] == "✘Issues found")
         passed_checks = sum(1 for v in master_updates.values() if v[0] == "✔No issues")
